@@ -29,6 +29,7 @@ if sys.platform == "win32":
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
 # uc.Chrome 종료 시 Windows 환경의 OSError [WinError 6] 핸들 오류 방지 패치
@@ -127,6 +128,8 @@ def create_driver(headless=False):
         print("[*] Chrome 메이저 버전 자동 감지 모드로 구동합니다.")
 
     options = uc.ChromeOptions()
+    # 1. pageLoadStrategy를 'eager'로 설정하여 불필요한 이미지/광고 로딩 대기로 인한 타임아웃 방지
+    options.page_load_strategy = "eager"
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
@@ -134,19 +137,23 @@ def create_driver(headless=False):
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--lang=ko-KR,ko")
 
+    # 2. 최신 일반 브라우저 User-Agent 헤더 적용
+    modern_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    options.add_argument(f"--user-agent={modern_ua}")
+
     # Cloud / Linux 환경 대응: headless 요청 시 옵션 추가
     is_headless = headless or os.environ.get("HEADLESS", "").lower() in ["1", "true", "yes"]
     if is_headless:
         print("[*] Headless(창 숨김) 모드로 브라우저를 실행합니다.")
         options.add_argument("--headless=new")
-        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
     driver_kwargs = {"options": options}
     if chrome_version:
         driver_kwargs["version_main"] = chrome_version
 
     driver = uc.Chrome(**driver_kwargs)
-    driver.set_page_load_timeout(30)
+    # 3. 페이지 로드 타임아웃 60초 설정
+    driver.set_page_load_timeout(60)
     return driver
 
 
@@ -351,6 +358,32 @@ function extractArticleFromNode(domNode) {
 """
 
 
+def get_url_with_retry(driver, url, max_retries=3, delay=4):
+    """
+    driver.get(url) 실행 시 net::ERR_CONNECTION_RESET이나 TimeoutException 등
+    네트워크 및 렌더러 지연 오류 발생 시 3~5초 대기 후 최대 3회까지 재접속을 시도합니다.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"  [-] 네이버 부동산 접속 중... ({attempt}/{max_retries}): {url}")
+            driver.get(url)
+            return True
+        except (TimeoutException, WebDriverException) as e:
+            err_line = str(e).splitlines()[0] if str(e) else repr(e)
+            print(f"  [!] 페이지 접속 오류 감지 ({attempt}/{max_retries}): {err_line}")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
+            if attempt < max_retries:
+                print(f"  [*] {delay}초 대기 후 재접속을 시도합니다...")
+                time.sleep(delay)
+            else:
+                print(f"  [x] 최대 재시도 횟수({max_retries}회)를 초과하여 접속에 실패했습니다.")
+                raise e
+
+
 def scrape_complex(driver, complex_info):
     """
     단일 단지의 매물 페이지를 방문하여 단일 매물 및 펼쳐진 동일 매물 묶음의 개별 매물들을 전부 수집합니다.
@@ -359,7 +392,7 @@ def scrape_complex(driver, complex_info):
     url = complex_info["url"]
     print(f"\n[{complex_name}] 매물 수집 시작: {url}")
 
-    driver.get(url)
+    get_url_with_retry(driver, url, max_retries=3, delay=4)
     time.sleep(3.5)
     main_window_handle = driver.current_window_handle
     close_extra_windows(driver, main_window_handle)
