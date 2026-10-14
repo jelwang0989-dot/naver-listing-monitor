@@ -128,12 +128,14 @@ def create_driver(headless=False):
         print("[*] Chrome 메이저 버전 자동 감지 모드로 구동합니다.")
 
     options = uc.ChromeOptions()
-    # 1. pageLoadStrategy를 'eager'로 설정하여 불필요한 이미지/광고 로딩 대기로 인한 타임아웃 방지
+    # 1. 렌더러 충돌 및 타임아웃 방지 필수 플래그 설정
     options.page_load_strategy = "eager"
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-browser-side-navigation")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--lang=ko-KR,ko")
 
@@ -152,8 +154,9 @@ def create_driver(headless=False):
         driver_kwargs["version_main"] = chrome_version
 
     driver = uc.Chrome(**driver_kwargs)
-    # 3. 페이지 로드 타임아웃 60초 설정
-    driver.set_page_load_timeout(60)
+    # 3. 페이지 로드 및 스크립트 타임아웃 설정 (30초)
+    driver.set_page_load_timeout(30)
+    driver.set_script_timeout(30)
     return driver
 
 
@@ -360,19 +363,66 @@ function extractArticleFromNode(domNode) {
 
 def get_url_with_retry(driver, url, max_retries=3, delay=4):
     """
-    driver.get(url) 실행 시 net::ERR_CONNECTION_RESET이나 TimeoutException 등
-    네트워크 및 렌더러 지연 오류 발생 시 3~5초 대기 후 최대 3회까지 재접속을 시도합니다.
+    driver.get(url) 실행 시 net::ERR_CONNECTION_RESET이나 TimeoutException
+    (특히 'Timed out receiving message from renderer') 발생 시,
+    드라이버를 즉시 중단시키지 않고 window.stop()을 실행하거나 해당 타임아웃을 캐치하여
+    페이지에 이미 로드된 요소를 탐색할 수 있도록 예외 처리를 수행합니다.
     """
     for attempt in range(1, max_retries + 1):
         try:
             print(f"  [-] 네이버 부동산 접속 중... ({attempt}/{max_retries}): {url}")
             driver.get(url)
             return True
-        except (TimeoutException, WebDriverException) as e:
+        except TimeoutException as e:
             err_line = str(e).splitlines()[0] if str(e) else repr(e)
-            print(f"  [!] 페이지 접속 오류 감지 ({attempt}/{max_retries}): {err_line}")
+            print(f"  [!] 페이지 로딩 타임아웃 감지 ({attempt}/{max_retries}): {err_line}")
+
+            # 1. 렌더러 무한 대기 방지 및 백그라운드 리소스 정지를 위해 window.stop() 호출
             try:
                 driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
+            # 2. 렌더러 타임아웃(receiving message from renderer 등) 발생 시 페이지 진입 여부 점검
+            try:
+                curr_url = driver.current_url or ""
+                ready_state = driver.execute_script("return document.readyState;")
+                print(f"  [*] 타임아웃 후 상태 확인 - URL: {curr_url}, readyState: {ready_state}")
+
+                if "naver.com" in curr_url:
+                    print("  [v] 네이버 부동산 도메인 진입 확인됨: 페이지에 로드된 요소를 기반으로 매물 탐색을 계속 진행합니다.")
+                    return True
+            except Exception as check_e:
+                print(f"  [*] 상태 점검 중 예외: {check_e}")
+
+            if attempt < max_retries:
+                print(f"  [*] {delay}초 대기 후 재접속을 시도합니다...")
+                time.sleep(delay)
+            else:
+                # 마지막 시도 후에도 네이버 도메인에 있다면 계속 진행 허용
+                try:
+                    curr_url = driver.current_url or ""
+                    if "naver.com" in curr_url:
+                        print("  [v] 마지막 시도 타임아웃 후 네이버 URL 감지됨: 매물 탐색을 계속 진행합니다.")
+                        return True
+                except Exception:
+                    pass
+                print(f"  [x] 최대 재시도 횟수({max_retries}회)를 초과하여 접속에 실패했습니다.")
+                raise e
+
+        except WebDriverException as e:
+            err_line = str(e).splitlines()[0] if str(e) else repr(e)
+            print(f"  [!] 웹드라이버 접속 오류 감지 ({attempt}/{max_retries}): {err_line}")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
+            try:
+                curr_url = driver.current_url or ""
+                if "naver.com" in curr_url:
+                    print("  [v] 오류 발생 후 네이버 부동산 도메인 도달 확인됨: 탐색을 계속 진행합니다.")
+                    return True
             except Exception:
                 pass
 
@@ -380,7 +430,7 @@ def get_url_with_retry(driver, url, max_retries=3, delay=4):
                 print(f"  [*] {delay}초 대기 후 재접속을 시도합니다...")
                 time.sleep(delay)
             else:
-                print(f"  [x] 최대 재시도 횟수({max_retries}회)를 초과하여 접속에 실패했습니다.")
+                print(f"  [x] 최대 재시도 횟수({max_retries}회)를 초과하였습니다.")
                 raise e
 
 

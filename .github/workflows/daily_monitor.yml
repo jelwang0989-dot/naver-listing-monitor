@@ -40,9 +40,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Real Estate Monitor with Virtual Display
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
           # xvfb-run을 통해 가상 화면(1920x1080)을 제공하여 네이버 부동산의 Headless 탐지(404 에러)를 완전 우회
-          xvfb-run --server-args="-screen 0 1920x1080x24" python monitor.py
+          xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac" python monitor.py
 
       - name: Commit and push changes
         run: |
