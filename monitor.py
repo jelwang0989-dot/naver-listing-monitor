@@ -30,6 +30,8 @@ if sys.platform == "win32":
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 
 # uc.Chrome 종료 시 Windows 환경의 OSError [WinError 6] 핸들 오류 방지 패치
@@ -131,6 +133,7 @@ def create_driver(headless=False):
     # 1. 렌더러 충돌 및 타임아웃 방지 필수 플래그 설정
     options.page_load_strategy = "eager"
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-dev-shm-usage")
@@ -154,6 +157,10 @@ def create_driver(headless=False):
         driver_kwargs["version_main"] = chrome_version
 
     driver = uc.Chrome(**driver_kwargs)
+    try:
+        driver.set_window_size(1920, 1080)
+    except Exception:
+        pass
     # 3. 페이지 로드 및 스크립트 타임아웃 설정 (30초)
     driver.set_page_load_timeout(30)
     driver.set_script_timeout(30)
@@ -365,73 +372,50 @@ def get_url_with_retry(driver, url, max_retries=3, delay=4):
     """
     driver.get(url) 실행 시 net::ERR_CONNECTION_RESET이나 TimeoutException
     (특히 'Timed out receiving message from renderer') 발생 시,
-    드라이버를 즉시 중단시키지 않고 window.stop()을 실행하거나 해당 타임아웃을 캐치하여
-    페이지에 이미 로드된 요소를 탐색할 수 있도록 예외 처리를 수행합니다.
+    window.stop()을 걸어 비동기 매물 호출을 차단하지 않고,
+    매물 목록 영역이 화면에 나타날 때까지 최대 15초간 명시적 대기(WebDriverWait)를 수행합니다.
     """
     for attempt in range(1, max_retries + 1):
         try:
             print(f"  [-] 네이버 부동산 접속 중... ({attempt}/{max_retries}): {url}")
             driver.get(url)
-            return True
         except TimeoutException as e:
             err_line = str(e).splitlines()[0] if str(e) else repr(e)
             print(f"  [!] 페이지 로딩 타임아웃 감지 ({attempt}/{max_retries}): {err_line}")
-
-            # 1. 렌더러 무한 대기 방지 및 백그라운드 리소스 정지를 위해 window.stop() 호출
-            try:
-                driver.execute_script("window.stop();")
-            except Exception:
-                pass
-
-            # 2. 렌더러 타임아웃(receiving message from renderer 등) 발생 시 페이지 진입 여부 점검
-            try:
-                curr_url = driver.current_url or ""
-                ready_state = driver.execute_script("return document.readyState;")
-                print(f"  [*] 타임아웃 후 상태 확인 - URL: {curr_url}, readyState: {ready_state}")
-
-                if "naver.com" in curr_url:
-                    print("  [v] 네이버 부동산 도메인 진입 확인됨: 페이지에 로드된 요소를 기반으로 매물 탐색을 계속 진행합니다.")
-                    return True
-            except Exception as check_e:
-                print(f"  [*] 상태 점검 중 예외: {check_e}")
-
-            if attempt < max_retries:
-                print(f"  [*] {delay}초 대기 후 재접속을 시도합니다...")
-                time.sleep(delay)
-            else:
-                # 마지막 시도 후에도 네이버 도메인에 있다면 계속 진행 허용
-                try:
-                    curr_url = driver.current_url or ""
-                    if "naver.com" in curr_url:
-                        print("  [v] 마지막 시도 타임아웃 후 네이버 URL 감지됨: 매물 탐색을 계속 진행합니다.")
-                        return True
-                except Exception:
-                    pass
-                print(f"  [x] 최대 재시도 횟수({max_retries}회)를 초과하여 접속에 실패했습니다.")
-                raise e
-
         except WebDriverException as e:
             err_line = str(e).splitlines()[0] if str(e) else repr(e)
             print(f"  [!] 웹드라이버 접속 오류 감지 ({attempt}/{max_retries}): {err_line}")
-            try:
-                driver.execute_script("window.stop();")
-            except Exception:
-                pass
 
+        # 매물 목록 영역(div.item_list, infinite_scroll, item) 로딩 대기 (최대 15초)
+        try:
+            print("  [-] 매물 목록 요소 로딩 대기 중 (최대 15초)...")
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    "div.item_list, div[class*='item_list'], div.infinite_scroll, div.item"
+                ))
+            )
+            print("  [v] 매물 목록 영역 감지 완료!")
+            return True
+        except TimeoutException:
+            print("  [*] 15초 내에 매물 목록 요소를 감지하지 못했습니다. 페이지 내부 요소 점검 중...")
+            # 1개라도 매물 관련 요소가 이미 렌더링되었는지 자바스크립트로 확인
             try:
-                curr_url = driver.current_url or ""
-                if "naver.com" in curr_url:
-                    print("  [v] 오류 발생 후 네이버 부동산 도메인 도달 확인됨: 탐색을 계속 진행합니다.")
+                has_items = driver.execute_script("""
+                    return document.querySelectorAll('div.item_list, div[class*="item_list"], div.infinite_scroll, .item').length > 0;
+                """)
+                if has_items:
+                    print("  [v] 매물 관련 요소가 1개 이상 감지되어 다음 단계로 진행합니다.")
                     return True
             except Exception:
                 pass
 
-            if attempt < max_retries:
-                print(f"  [*] {delay}초 대기 후 재접속을 시도합니다...")
-                time.sleep(delay)
-            else:
-                print(f"  [x] 최대 재시도 횟수({max_retries}회)를 초과하였습니다.")
-                raise e
+        if attempt < max_retries:
+            print(f"  [*] {delay}초 대기 후 페이지 재접속을 시도합니다...")
+            time.sleep(delay)
+        else:
+            print(f"  [!] 최대 재시도 횟수({max_retries}회)에 도달했습니다. 현재 로드된 상태에서 수집을 시도합니다.")
+            return True
 
 
 def scrape_complex(driver, complex_info):
@@ -443,10 +427,32 @@ def scrape_complex(driver, complex_info):
     print(f"\n[{complex_name}] 매물 수집 시작: {url}")
 
     get_url_with_retry(driver, url, max_retries=3, delay=4)
-    time.sleep(3.5)
+    time.sleep(2.5)
     main_window_handle = driver.current_window_handle
     close_extra_windows(driver, main_window_handle)
     dismiss_overlays(driver)
+
+    # 0. 매물 탭 활성화 확인 (필요한 경우 클릭)
+    ensure_article_tab_js = """
+    const items = document.querySelectorAll('.item_list .item, .item_list--article');
+    if (items.length === 0) {
+        const tabs = document.querySelectorAll('button, a, [role="tab"]');
+        for (let el of tabs) {
+            let t = (el.innerText || '').trim();
+            if (t === '매물' || t.startsWith('매물 ') || t.startsWith('매물(') || t.startsWith('매물\n') || t === '전체매물') {
+                el.click();
+                return true;
+            }
+        }
+    }
+    return false;
+    """
+    try:
+        if driver.execute_script(ensure_article_tab_js):
+            print("  [-] '매물' 탭 클릭 활성화. 목록 로딩 대기...")
+            time.sleep(2)
+    except Exception:
+        pass
 
     # 1. '동일매물 묶기' 체크박스 활성화 확인 (동일 매물 묶음 구조 파악)
     ensure_grouped_js = """
