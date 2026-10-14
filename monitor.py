@@ -12,11 +12,15 @@ import json
 import time
 import argparse
 import traceback
+import requests
 if sys.platform == "win32":
     import winreg
 else:
     winreg = None
 from datetime import datetime
+
+# Google Apps Script 웹앱 URL
+GOOGLE_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxAjBEnfiDRS7L9Gvp1aypbTd6wQOsM-VhgjfVQ2rGxfUXVc_6196GIs4zGWdJrzk1u/exec"
 
 # Windows 콘솔 인코딩 UTF-8 설정
 if sys.platform == "win32":
@@ -279,7 +283,10 @@ function extractArticleFromNode(domNode) {
                                 dealOrWarrantPrc: val.dealOrWarrantPrc || '',
                                 rentPrc: val.rentPrc ? String(val.rentPrc).trim() : '',
                                 realtorName: val.realtorName || (val.realtor && val.realtor.realtorName) || '',
-                                sameAddrCnt: Number(val.sameAddrCnt || 1)
+                                sameAddrCnt: Number(val.sameAddrCnt || 1),
+                                area1: val.area1 ? String(val.area1) : '',
+                                area2: val.area2 ? String(val.area2) : '',
+                                areaName: val.areaName || ''
                             };
                         }
                     }
@@ -305,6 +312,8 @@ function extractArticleFromNode(domNode) {
         let specText = specEl ? specEl.innerText.trim() : '';
         let floorMatch = specText.match(/(\\d+\\/\\d+층|\\d+층|[저중고]\\/\\d+층|[저중고]층)/);
         let floor = floorMatch ? floorMatch[1] : '';
+        let areaMatch = specText.match(/(\\d+[A-Za-z가-힣]*\\/\\d+m²|\\d+m²|\\d+[A-Za-z])/);
+        let areaStr = areaMatch ? areaMatch[1] : '';
         
         let tradeType = priceTypeEl ? priceTypeEl.innerText.trim() : '';
         let price = priceValEl ? priceValEl.innerText.trim() : '';
@@ -329,7 +338,10 @@ function extractArticleFromNode(domNode) {
                 dealOrWarrantPrc: price,
                 rentPrc: '',
                 realtorName: realtor,
-                sameAddrCnt: 1
+                sameAddrCnt: 1,
+                area1: '',
+                area2: '',
+                areaName: areaStr
             };
         }
     } catch(e) {}
@@ -539,6 +551,21 @@ def format_listing_dict(complex_name, raw_data):
     else:
         dong_str = dong_raw
 
+    # 면적 정제
+    area_name = str(raw_data.get("areaName", "")).strip()
+    area2 = str(raw_data.get("area2", "")).strip()
+    area1 = str(raw_data.get("area1", "")).strip()
+    if area_name and area2:
+        area_str = f"{area_name}/{area2}㎡"
+    elif area1 and area2:
+        area_str = f"{area1}/{area2}㎡"
+    elif area2:
+        area_str = f"{area2}㎡"
+    elif area_name:
+        area_str = area_name
+    else:
+        area_str = str(raw_data.get("area", "")).strip()
+
     # 가격 정제 (월세의 경우 보증금/월세 결합)
     trade_type = str(raw_data.get("tradeTypeName", "")).strip()
     deal_prc = str(raw_data.get("dealOrWarrantPrc", "")).strip()
@@ -559,10 +586,64 @@ def format_listing_dict(complex_name, raw_data):
         "매물번호": art_no,
         "동": dong_str,
         "층": floor_str,
+        "면적": area_str,
         "거래유형": trade_type,
         "가격": price_str,
         "등록공인중개사명": str(raw_data.get("realtorName", "")).strip()
     }
+
+
+def send_to_google_sheet(new_listings):
+    """
+    감지된 신규 매물 리스트를 구글 시트 웹앱(Google Apps Script)으로 POST 전송합니다.
+    """
+    if not GOOGLE_WEBAPP_URL:
+        print("[!] 구글 시트 웹앱 URL이 설정되지 않았습니다.")
+        return False
+
+    if not new_listings:
+        print("[*] 구글 시트 전송: 새로 감지된 신규 매물이 없어 전송을 건너뜁니다.")
+        return True
+
+    payload_items = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for nl in new_listings:
+        item = {
+            "detected_at": nl.get("감지일시", now_str),
+            "complex_name": nl.get("단지명", ""),
+            "trade_type": nl.get("거래유형", ""),
+            "price": nl.get("가격", ""),
+            "building": nl.get("동", ""),
+            "floor": nl.get("층", ""),
+            "area": nl.get("면적", ""),
+            "agency": nl.get("등록공인중개사명", ""),
+            "article_no": nl.get("매물번호", "")
+        }
+        payload_items.append(item)
+
+    payload = {"listings": payload_items}
+    print(f"\n[+] 구글 시트 웹앱으로 신규 매물 {len(payload_items)}건 전송 시작...")
+
+    try:
+        response = requests.post(
+            GOOGLE_WEBAPP_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        if response.status_code == 200:
+            print(f"[v] 구글 시트 전송 성공! (HTTP {response.status_code}) 응답: {response.text.strip()}")
+            return True
+        else:
+            print(f"[!] 구글 시트 전송 경고: 상태 코드 {response.status_code}, 응답: {response.text.strip()}")
+            return False
+    except requests.exceptions.Timeout:
+        print("[!] 구글 시트 전송 실패: 요청 시간 초과 (30초 timeout)")
+        return False
+    except Exception as e:
+        print(f"[!] 구글 시트 전송 중 오류 발생: {e}")
+        return False
 
 
 def compare_and_record_listings(current_list):
@@ -654,7 +735,13 @@ def compare_and_record_listings(current_list):
         json.dump(new_listings, f, ensure_ascii=False, indent=2)
     print(f"[+] 신규 매물 목록 저장: {NEW_FILE} ({len(new_listings)}건)")
 
-    # 4. known_listings.json 갱신
+    # 4. 구글 시트 웹앱 전송
+    if new_listings:
+        send_to_google_sheet(new_listings)
+    else:
+        print("[*] 구글 시트 전송: 새로 감지된 신규 매물이 없어 전송을 건너뜁니다.")
+
+    # 5. known_listings.json 갱신
     with open(KNOWN_FILE, "w", encoding="utf-8") as f:
         json.dump(current_list, f, ensure_ascii=False, indent=2)
     print(f"[+] 기준 매물 데이터 갱신 완료: {KNOWN_FILE} ({len(current_list)}건)")
@@ -704,7 +791,29 @@ def main():
     parser.add_argument("--loop", action="store_true", help="지정된 주기마다 반복 감시 모드로 실행")
     parser.add_argument("--interval", type=int, default=300, help="반복 감시 주기 (초 단위, 기본 300초=5분)")
     parser.add_argument("--headless", action="store_true", help="브라우저 창을 띄우지 않고 백그라운드(Headless)로 실행")
+    parser.add_argument("--test-sheet", action="store_true", help="구글 시트 웹앱 연동 테스트 (샘플 1건 전송)")
     args = parser.parse_args()
+
+    if args.test_sheet:
+        print("[*] 구글 시트 웹앱 연동 테스트를 진행합니다...")
+        mock_sample = [{
+            "단지명": "다산팬테리움리버테라스I",
+            "거래유형": "매매",
+            "가격": "8억 5,000",
+            "동": "101동",
+            "층": "15/25층",
+            "면적": "111B/84㎡",
+            "등록공인중개사명": "테스트공인중개사사무소",
+            "매물번호": "TEST_" + datetime.now().strftime("%Y%m%d%H%M%S"),
+            "감지일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "감지이유": "테스트 전송"
+        }]
+        success = send_to_google_sheet(mock_sample)
+        if success:
+            print("[v] 구글 시트 웹앱 연동 테스트 완료!")
+        else:
+            print("[x] 구글 시트 웹앱 연동 테스트 실패.")
+        return
 
     if args.loop:
         print(f"[*] 주기적 반복 감시 모드 시작 (감시 주기: {args.interval}초)")
